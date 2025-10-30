@@ -1,22 +1,6 @@
 // /api/callback.js
 const https = require("https");
 
-function htmlSuccess(token) {
-  // Decap/Netlify CMS listens for this postMessage
-  return `
-<!doctype html>
-<meta charset="utf-8">
-<title>Authorized</title>
-<script>
-  (function () {
-    var msg = 'authorization:github:success:${token}';
-    try { window.opener && window.opener.postMessage(msg, '*'); } catch (e) {}
-    window.close();
-  })();
-</script>
-<p>Authorized. You can close this window.</p>`;
-}
-
 function htmlError(err) {
   return `
 <!doctype html>
@@ -53,7 +37,7 @@ function exchangeCode({ code, client_id, client_secret, redirect_uri }) {
           const json = JSON.parse(data);
           if (json.error) return reject(json.error_description || json.error);
           resolve(json.access_token);
-        } catch (e) {
+        } catch {
           reject("Invalid token response");
         }
       });
@@ -65,8 +49,7 @@ function exchangeCode({ code, client_id, client_secret, redirect_uri }) {
 }
 
 function getRedirectURI(req) {
-  const proto =
-    (req.headers["x-forwarded-proto"] || "").split(",")[0] || "https";
+  const proto = (req.headers["x-forwarded-proto"] || "").split(",")[0] || "https";
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   return `${proto}://${host}/api/callback`;
 }
@@ -80,11 +63,13 @@ module.exports = async (req, res) => {
     return;
   }
 
+  // Verify state cookie
   const cookies = String(req.headers.cookie || "")
     .split(";")
     .map(s => s.trim());
   const stateCookie =
     cookies.find(c => c.startsWith("oauth_state="))?.split("=")[1] || "";
+
   if (!state || state !== stateCookie) {
     res.status(400).send(htmlError("Invalid state"));
     return;
@@ -98,13 +83,62 @@ module.exports = async (req, res) => {
       redirect_uri: getRedirectURI(req)
     });
 
-    // Clear the state cookie
+    // Fetch GitHub user
+    const userInfo = await new Promise((resolve, reject) => {
+      const opts = {
+        hostname: "api.github.com",
+        path: "/user",
+        method: "GET",
+        headers: {
+          "Authorization": `token ${token}`,
+          "User-Agent": "DecapCMS-OAuth-App"
+        }
+      };
+
+      const r = https.request(opts, response => {
+        let data = "";
+        response.on("data", d => (data += d));
+        response.on("end", () => resolve(JSON.parse(data)));
+      });
+
+      r.on("error", reject);
+      r.end();
+    });
+
+    const payload = {
+      token,
+      provider: "github",
+      user: {
+        login: userInfo.login,
+        name: userInfo.name,
+        avatar_url: userInfo.avatar_url
+      }
+    };
+
+    // Clear cookie
     res.setHeader(
       "Set-Cookie",
       "oauth_state=; Path=/api/callback; Max-Age=0; HttpOnly; SameSite=Lax; Secure"
     );
+
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.end(htmlSuccess(token));
+
+    // Final HTML with correct postMessage for Decap
+    res.end(`
+<!doctype html>
+<html>
+<body>
+<script>
+  window.opener.postMessage(
+    'authorization:github:success:${Buffer.from(JSON.stringify(payload)).toString("base64")}',
+    '*'
+  );
+  window.close();
+</script>
+<p>Authorized. You can close this window.</p>
+</body>
+</html>
+    `);
   } catch (err) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.status(400).end(htmlError(String(err)));
