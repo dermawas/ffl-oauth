@@ -1,6 +1,22 @@
 // /api/callback.js
 const https = require("https");
 
+function htmlSuccess(token) {
+  // IMPORTANT: use backticks so ${token} interpolates!
+  return `
+<!doctype html>
+<meta charset="utf-8">
+<title>Authorized</title>
+<script>
+  (function () {
+    var msg = \`authorization:github:success:${token}\`;
+    try { window.opener && window.opener.postMessage(msg, '*'); } catch (e) {}
+    window.close();
+  })();
+</script>
+<p>Authorized. You can close this window.</p>`;
+}
+
 function htmlError(err) {
   return `
 <!doctype html>
@@ -8,12 +24,12 @@ function htmlError(err) {
 <title>Authorization Error</title>
 <script>
   (function () {
-    var msg = 'authorization:github:error:${err.replace(/'/g,"\\'")}';
+    var msg = \`authorization:github:error:${String(err).replace(/'/g,"\\'")}\`;
     try { window.opener && window.opener.postMessage(msg, '*'); } catch (e) {}
     window.close();
   })();
 </script>
-<p>Authorization failed: ${err}</p>`;
+<p>Authorization failed: ${String(err)}</p>`;
 }
 
 function exchangeCode({ code, client_id, client_secret, redirect_uri }) {
@@ -25,7 +41,8 @@ function exchangeCode({ code, client_id, client_secret, redirect_uri }) {
     headers: {
       "Content-Type": "application/json",
       "Accept": "application/json",
-      "Content-Length": Buffer.byteLength(body)
+      "Content-Length": Buffer.byteLength(body),
+      "User-Agent": "decap-oauth-proxy"
     }
   };
   return new Promise((resolve, reject) => {
@@ -36,8 +53,9 @@ function exchangeCode({ code, client_id, client_secret, redirect_uri }) {
         try {
           const json = JSON.parse(data);
           if (json.error) return reject(json.error_description || json.error);
+          if (!json.access_token) return reject("No access_token in response");
           resolve(json.access_token);
-        } catch {
+        } catch (e) {
           reject("Invalid token response");
         }
       });
@@ -62,14 +80,15 @@ module.exports = async (req, res) => {
     res.status(400).send(htmlError("Missing ?code"));
     return;
   }
+  if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET) {
+    res.status(500).send(htmlError("Missing GITHUB_CLIENT_ID/SECRET"));
+    return;
+  }
 
-  // Verify state cookie
   const cookies = String(req.headers.cookie || "")
     .split(";")
     .map(s => s.trim());
-  const stateCookie =
-    cookies.find(c => c.startsWith("oauth_state="))?.split("=")[1] || "";
-
+  const stateCookie = cookies.find(c => c.startsWith("oauth_state="))?.split("=")[1] || "";
   if (!state || state !== stateCookie) {
     res.status(400).send(htmlError("Invalid state"));
     return;
@@ -83,62 +102,13 @@ module.exports = async (req, res) => {
       redirect_uri: getRedirectURI(req)
     });
 
-    // Fetch GitHub user
-    const userInfo = await new Promise((resolve, reject) => {
-      const opts = {
-        hostname: "api.github.com",
-        path: "/user",
-        method: "GET",
-        headers: {
-          "Authorization": `token ${token}`,
-          "User-Agent": "DecapCMS-OAuth-App"
-        }
-      };
-
-      const r = https.request(opts, response => {
-        let data = "";
-        response.on("data", d => (data += d));
-        response.on("end", () => resolve(JSON.parse(data)));
-      });
-
-      r.on("error", reject);
-      r.end();
-    });
-
-    const payload = {
-      token,
-      provider: "github",
-      user: {
-        login: userInfo.login,
-        name: userInfo.name,
-        avatar_url: userInfo.avatar_url
-      }
-    };
-
-    // Clear cookie
+    // Clear the state cookie
     res.setHeader(
       "Set-Cookie",
-      "oauth_state=; Path=/api/callback; Max-Age=0; HttpOnly; SameSite=Lax; Secure"
+      "oauth_state=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"
     );
-
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-
-    // Final HTML with correct postMessage for Decap
-    res.end(`
-<!doctype html>
-<html>
-<body>
-<script>
-  window.opener.postMessage(
-    'authorization:github:success:${Buffer.from(JSON.stringify(payload)).toString("base64")}',
-    '*'
-  );
-  window.close();
-</script>
-<p>Authorized. You can close this window.</p>
-</body>
-</html>
-    `);
+    res.end(htmlSuccess(token));
   } catch (err) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.status(400).end(htmlError(String(err)));
