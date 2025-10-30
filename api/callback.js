@@ -1,8 +1,8 @@
-// /api/callback.js
 const https = require("https");
 
-function htmlSuccess(token) {
-  // IMPORTANT: use backticks so ${token} interpolates!
+function htmlSuccess(token, openerOrigin = "*") {
+  // send to '*' AND to your exact site origin as a fallback
+  const siteOrigin = "https://flowformlab.com";
   return `
 <!doctype html>
 <meta charset="utf-8">
@@ -10,7 +10,12 @@ function htmlSuccess(token) {
 <script>
   (function () {
     var msg = \`authorization:github:success:${token}\`;
-    try { window.opener && window.opener.postMessage(msg, '*'); } catch (e) {}
+    try {
+      if (window.opener) {
+        window.opener.postMessage(msg, "*");
+        window.opener.postMessage(msg, "${siteOrigin}");
+      }
+    } catch (e) {}
     window.close();
   })();
 </script>
@@ -25,7 +30,7 @@ function htmlError(err) {
 <script>
   (function () {
     var msg = \`authorization:github:error:${String(err).replace(/'/g,"\\'")}\`;
-    try { window.opener && window.opener.postMessage(msg, '*'); } catch (e) {}
+    try { window.opener && window.opener.postMessage(msg, "*"); } catch (e) {}
     window.close();
   })();
 </script>
@@ -55,7 +60,7 @@ function exchangeCode({ code, client_id, client_secret, redirect_uri }) {
           if (json.error) return reject(json.error_description || json.error);
           if (!json.access_token) return reject("No access_token in response");
           resolve(json.access_token);
-        } catch (e) {
+        } catch {
           reject("Invalid token response");
         }
       });
@@ -68,7 +73,7 @@ function exchangeCode({ code, client_id, client_secret, redirect_uri }) {
 
 function getRedirectURI(req) {
   const proto = (req.headers["x-forwarded-proto"] || "").split(",")[0] || "https";
-  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  const host  = req.headers["x-forwarded-host"] || req.headers.host;
   return `${proto}://${host}/api/callback`;
 }
 
@@ -76,22 +81,16 @@ module.exports = async (req, res) => {
   const { code, state } = req.query || {};
   const { GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET } = process.env;
 
-  if (!code) {
-    res.status(400).send(htmlError("Missing ?code"));
-    return;
-  }
-  if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET) {
-    res.status(500).send(htmlError("Missing GITHUB_CLIENT_ID/SECRET"));
-    return;
-  }
+  if (!code)      return res.status(400).send(htmlError("Missing ?code"));
+  if (!state)     return res.status(400).send(htmlError("Missing ?state"));
+  if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET)
+    return res.status(500).send(htmlError("Missing GITHUB_CLIENT_ID/SECRET"));
 
   const cookies = String(req.headers.cookie || "")
-    .split(";")
-    .map(s => s.trim());
+    .split(";").map(s => s.trim());
   const stateCookie = cookies.find(c => c.startsWith("oauth_state="))?.split("=")[1] || "";
-  if (!state || state !== stateCookie) {
-    res.status(400).send(htmlError("Invalid state"));
-    return;
+  if (state !== stateCookie) {
+    return res.status(400).send(htmlError("Invalid state"));
   }
 
   try {
@@ -102,11 +101,8 @@ module.exports = async (req, res) => {
       redirect_uri: getRedirectURI(req)
     });
 
-    // Clear the state cookie
-    res.setHeader(
-      "Set-Cookie",
-      "oauth_state=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"
-    );
+    // clear state cookie
+    res.setHeader("Set-Cookie", "oauth_state=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure");
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.end(htmlSuccess(token));
   } catch (err) {
